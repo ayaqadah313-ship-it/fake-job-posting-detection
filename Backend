@@ -1,1 +1,606 @@
 
+from fastapi import APIRouter, HTTPException
+from backend.schemas import LoginRequest
+from backend.database_manager import (
+    get_all_jobs_with_results,
+    delete_job,
+    get_feedback_count
+)
+
+router = APIRouter()
+
+
+@router.post("/login")
+def admin_login(data: LoginRequest):
+    # Temporary hardcoded admin credentials for the prototype
+    # You can safely change these as long as the frontend login form
+    # uses the same new username/password when you test.
+    if data.username == "admin" and data.password == "FJPD_Admin_2026!":
+        return {"message": "Login successful"}
+
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+@router.get("/records")
+def get_records():
+    records = get_all_jobs_with_results()
+
+    formatted_records = []
+    for row in records:
+        formatted_records.append({
+            "post_id": row[0],
+            "title": row[1],
+            "prediction": row[2],
+            "confidence": row[3]
+        })
+
+    return formatted_records
+
+
+@router.get("/stats")
+def get_stats():
+    records = get_all_jobs_with_results()
+
+    total = len(records)
+    fake = 0
+    real = 0
+
+    for row in records:
+        prediction = str(row[2]).strip().lower() if row[2] is not None else ""
+
+        if prediction == "fake":
+            fake += 1
+        elif prediction == "real":
+            real += 1
+
+    fake_rate = round((fake / total) * 100, 1) if total > 0 else 0.0
+    feedback_count = get_feedback_count()
+
+    return {
+        "total": total,
+        "fake_count": fake,
+        "real_count": real,
+        "fake_rate": fake_rate,
+        "feedback_count": feedback_count
+    }
+
+
+@router.delete("/record/{record_id}")
+def delete_record(record_id: int):
+    delete_job(record_id)
+    return {"message": f"Record {record_id} deleted successfully"}
+from fastapi import APIRouter, HTTPException
+from backend.schemas import AnalyzeRequest, AnalyzeResponse
+from backend.utils import predict_job
+from backend.database_manager import add_job_post, add_analysis_result
+
+router = APIRouter()
+
+
+@router.post("/analyze", response_model=AnalyzeResponse)
+def analyze_job(data: AnalyzeRequest):
+    # Reject empty input
+    if not data.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    try:
+        # Run prediction using backend model pipeline
+        prediction, confidence = predict_job(data.title, data.text)
+
+        # Make sure confidence is a float and rounded cleanly
+        confidence = round(float(confidence), 4)
+
+        # Temporary default user until full user system is added
+        user_id = 1
+
+        # Store submitted job post in database
+        post_id = add_job_post(data.title, data.text, user_id)
+
+        # Store prediction result in database
+        add_analysis_result(post_id, prediction, confidence)
+
+        # Return API response
+        return AnalyzeResponse(
+            prediction=prediction,
+            confidence=confidence
+        )
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+from fastapi import APIRouter, HTTPException
+from backend.schemas import FeedbackRequest
+from backend.database_manager import add_feedback, get_all_feedback
+import sqlite3
+
+router = APIRouter()
+
+
+@router.post("/feedback")
+def submit_feedback(data: FeedbackRequest):
+    if not data.feedback.strip():
+        raise HTTPException(status_code=400, detail="Feedback cannot be empty")
+
+    # Temporary default user until full user handling is added
+    user_id = 1
+
+    try:
+        contact_value = data.contact.strip() if data.contact and data.contact.strip() else None
+
+        add_feedback(
+            user_id=user_id,
+            post_id=data.job_id,
+            contact=contact_value,
+            message=data.feedback
+        )
+
+        return {"message": "Feedback submitted successfully"}
+
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid job_id. Make sure the job exists before submitting feedback."
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/feedback")
+def get_feedback():
+    try:
+        feedback_rows = get_all_feedback()
+
+        formatted_feedback = []
+        for row in feedback_rows:
+            formatted_feedback.append({
+                "feedback_id": row[0],
+                "user_id": row[1],
+                "post_id": row[2],
+                "contact": row[3],
+                "message": row[4],
+                "created_at": row[5]
+            })
+
+        return formatted_feedback
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+import os
+import sqlite3  # Import the library to work with the database
+
+BASE_DIR = os.path.dirname(__file__)
+DB_PATH = os.path.join(BASE_DIR, "fjpd_system.db")
+
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+# Function to create the database file and tables
+def init_database():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Create 'User' table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS User (
+        user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        display_name TEXT NOT NULL
+    )
+    ''')
+
+    # Create 'JobPost' table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS JobPost (
+        post_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT,
+        description TEXT NOT NULL,
+        submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES User (user_id) ON DELETE CASCADE
+    )
+    ''')
+
+    # Create 'Result' table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS Result (
+        result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        post_id INTEGER NOT NULL UNIQUE,
+        prediction TEXT NOT NULL,
+        confidence_score FLOAT,
+        FOREIGN KEY (post_id) REFERENCES JobPost (post_id) ON DELETE CASCADE
+    )
+    ''')
+
+    # Create 'ADMIN' table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS ADMIN (
+        admin_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        password TEXT NOT NULL,
+        role TEXT NOT NULL
+    )
+    ''')
+
+    # Create 'FEEDBACK' table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS FEEDBACK (
+        feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        post_id INTEGER,
+        contact TEXT,
+        message TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES User (user_id),
+        FOREIGN KEY (post_id) REFERENCES JobPost (post_id) ON DELETE CASCADE
+    )
+    ''')
+
+    conn.commit()
+
+    # Add contact column if database already exists from old version
+    try:
+        cursor.execute("ALTER TABLE FEEDBACK ADD COLUMN contact TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Column already exists, so ignore
+        pass
+
+    conn.close()
+
+
+# Function to add a new job post (Insert)
+def add_job_post(title, description, user_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Using placeholders (?) to prevent SQL Injection
+    cursor.execute('''
+        INSERT INTO JobPost (title, description, user_id)
+        VALUES (?, ?, ?)
+    ''', (title, description, user_id))
+
+    post_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return post_id
+
+
+# Function to get all stored jobs (Select)
+def get_all_jobs():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM JobPost')
+    jobs = cursor.fetchall()
+    conn.close()
+    return jobs
+
+
+# Function to delete a specific job using its ID
+def delete_job(post_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM JobPost WHERE post_id = ?', (post_id,))
+    conn.commit()
+    conn.close()
+    print(f"Job number {post_id} deleted successfully")
+
+
+# Function to save AI analysis results
+def add_analysis_result(post_id, prediction, confidence_score):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO Result (post_id, prediction, confidence_score)
+        VALUES (?, ?, ?)
+    ''', (post_id, prediction, confidence_score))
+    conn.commit()
+    conn.close()
+    print(f"Analysis result for job {post_id} saved successfully")
+
+
+# Function to get all jobs with AI results for Dashboard
+def get_all_jobs_with_results():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT JobPost.post_id, JobPost.title, Result.prediction, Result.confidence_score
+        FROM JobPost
+        LEFT JOIN Result ON JobPost.post_id = Result.post_id
+    ''')
+    data = cursor.fetchall()
+    conn.close()
+    return data
+
+
+# Function to add an Admin (Based on ADMIN table)
+def add_admin(username, password, role):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO ADMIN (username, password, role) VALUES (?, ?, ?)',
+        (username, password, role)
+    )
+    conn.commit()
+    conn.close()
+    print(f"Admin {username} added successfully")
+
+
+# Function to add Feedback (Based on FEEDBACK table)
+def add_feedback(user_id, post_id, contact, message):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO FEEDBACK (user_id, post_id, contact, message)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, post_id, contact, message))
+    conn.commit()
+    conn.close()
+    print("Feedback added successfully")
+
+
+# Main Entry Point: Runs only when executing this file directly
+if __name__ == "__main__":
+    init_database()
+    print("Database is ready and tables are created successfully")
+
+
+def ensure_default_user():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_id FROM User WHERE user_id = 1")
+    user = cursor.fetchone()
+
+    if not user:
+        cursor.execute(
+            "INSERT INTO User (user_id, display_name) VALUES (?, ?)",
+            (1, "Default User")
+        )
+        conn.commit()
+
+    conn.close()
+
+
+def get_all_feedback():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT feedback_id, user_id, post_id, contact, message, created_at
+        FROM FEEDBACK
+        ORDER BY created_at DESC
+    ''')
+    data = cursor.fetchall()
+    conn.close()
+    return data
+
+
+def get_feedback_count():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT COUNT(*) FROM FEEDBACK')
+    count = cursor.fetchone()[0]
+
+    conn.close()
+    return count
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+
+from backend.routes.analyze import router as analyze_router
+from backend.routes.feedback import router as feedback_router
+from backend.routes.admin import router as admin_router
+from backend.database_manager import init_database, ensure_default_user
+from backend.utils import load_models
+
+print("USING backend/main.py")
+
+BASE_DIR = os.path.dirname(__file__)
+FRONTEND_PATH = os.path.join(BASE_DIR, "frontend.html")
+
+app = FastAPI(title="Fake Job Post Detection API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(analyze_router)
+app.include_router(feedback_router)
+app.include_router(admin_router)
+
+
+@app.get("/")
+def serve_frontend():
+    return FileResponse(FRONTEND_PATH)
+
+
+init_database()
+ensure_default_user()
+load_models()
+from pydantic import BaseModel
+from typing import Optional
+
+
+class AnalyzeRequest(BaseModel):
+    title: str
+    text: str
+
+
+class AnalyzeResponse(BaseModel):
+    prediction: str
+    confidence: float
+
+
+class FeedbackRequest(BaseModel):
+    job_id: int
+    feedback: str
+    contact: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+import joblib
+import os
+import re
+import string
+import numpy as np
+import scipy.sparse as sp
+
+model = None
+vectorizer = None
+
+
+# ============================================================
+# تنظيف النص قبل TF-IDF
+# ============================================================
+def preprocess(text: str) -> str:
+    text = text.lower()
+
+    # إزالة الأرقام من النص
+    text = re.sub(r"\d+", "", text)
+
+    # إزالة علامات الترقيم
+    text = text.translate(str.maketrans("", "", string.punctuation))
+
+    # إزالة المسافات الزائدة
+    text = text.strip()
+
+    return text
+
+
+# ============================================================
+# تحميل الموديل والـ vectorizer
+# ============================================================
+def load_models():
+    global model, vectorizer
+
+    base_dir = os.path.dirname(__file__)
+    model_path = os.path.join(base_dir, "model", "best_model.pkl")
+    vectorizer_path = os.path.join(base_dir, "model", "tfidf_vectorizer.pkl")
+
+    model = joblib.load(model_path)
+    vectorizer = joblib.load(vectorizer_path)
+
+
+# ============================================================
+# التنبؤ بالإعلان الوظيفي
+# ============================================================
+def predict_job(title: str, text: str):
+    global model, vectorizer
+
+    if model is None or vectorizer is None:
+        raise RuntimeError("Model or vectorizer not loaded")
+
+    if not text.strip():
+        raise ValueError("Text cannot be empty")
+
+    # دمج العنوان مع النص
+    full_text = f"{title} {text}".strip()
+
+    # تنظيف النص قبل TF-IDF
+    cleaned_text = preprocess(full_text)
+
+    # ========================================================
+    # Text -> TF-IDF
+    # ========================================================
+    text_vector = vectorizer.transform([cleaned_text])
+
+    # ========================================================
+    # Binary features
+    # لازم يكون نفس ترتيب التدريب تمامًا:
+    # [has_salary_mentioned, has_company_logo, has_questions, is_remote]
+    # ========================================================
+    lower_text = full_text.lower()
+
+    salary_pattern = r"\b(salary|sar|riyal|riyals|\$|per month|per week|monthly|weekly)\b"
+    has_salary_mentioned = int(bool(re.search(salary_pattern, lower_text)))
+
+    # من الواجهة الحالية هذه القيم غير موجودة فعليًا
+    has_company_logo = 0
+    has_questions = 0
+
+    is_remote = int(
+        "remote" in lower_text or
+        "work from home" in lower_text
+    )
+
+    binary_features = sp.csr_matrix([[
+        has_salary_mentioned,
+        has_company_logo,
+        has_questions,
+        is_remote
+    ]])
+
+    # ========================================================
+    # Combine TF-IDF + binary features
+    # ========================================================
+    X_final = sp.hstack([text_vector, binary_features], format="csr")
+
+    # ========================================================
+    # Prediction
+    # ========================================================
+    prediction = model.predict(X_final)[0]
+
+    # ========================================================
+    # Confidence
+    # ========================================================
+    confidence = _get_confidence(model, X_final, prediction)
+
+    # ========================================================
+    # Label mapping
+    # 1 = Fake
+    # 0 = Real
+    # ========================================================
+    label = "Fake" if int(prediction) == 1 else "Real"
+
+    return label, confidence
+
+
+# ============================================================
+# حساب الـ confidence
+# ============================================================
+def _get_confidence(model_obj, X, prediction):
+    try:
+        if hasattr(model_obj, "predict_proba"):
+            proba = model_obj.predict_proba(X)[0]
+            predicted_class_idx = int(prediction)
+            return float(proba[predicted_class_idx])
+
+        elif hasattr(model_obj, "decision_function"):
+            score = model_obj.decision_function(X)
+
+            if np.isscalar(score):
+                return float(1 / (1 + np.exp(-abs(score))))
+
+            score = np.asarray(score).flatten()
+
+            if len(score) == 1:
+                return float(1 / (1 + np.exp(-abs(score[0]))))
+
+            predicted_class_idx = int(prediction)
+            selected_score = score[predicted_class_idx] if predicted_class_idx < len(score) else score[0]
+            return float(1 / (1 + np.exp(-abs(selected_score))))
+
+        else:
+            return 0.75
+
+    except Exception:
+        return 0.75
